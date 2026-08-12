@@ -1,7 +1,7 @@
 use crate::archive::clickhouse::config::ClickHouseArchiveConfig;
 use crate::db::refcount;
 use crate::db::{DBIterator, DBOp, DBSlice, DBTransaction, Database};
-use crate::{DBCol, StoreStatistics};
+use crate::{CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY, DBCol, StoreStatistics};
 use anyhow::{Context, Error, Result, anyhow, bail, ensure};
 use hex::encode as hex_encode;
 use reqwest::StatusCode;
@@ -76,6 +76,25 @@ impl ClickHouseDB {
         self.config.write_enabled
     }
 
+    pub fn bootstrap_from_local_cold_store(&self) -> bool {
+        self.config.bootstrap_from_local_cold_store
+    }
+
+    pub fn write_bootstrap_progress(&self, value: Vec<u8>, sequence: u64) -> Result<()> {
+        let progress_height = self
+            .archive_height
+            .load(Ordering::Relaxed)
+            .checked_add(sequence)
+            .context("clickhouse bootstrap progress height overflow")?;
+        self.write_rows_at_height(
+            &[RowWithColumn {
+                column: column_name(DBCol::BlockMisc),
+                row: Row { key: CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY.to_vec(), value, deleted: false },
+            }],
+            progress_height,
+        )
+    }
+
     pub fn begin_archive_height(&self, height: u64) {
         self.archive_height.store(height, Ordering::Relaxed);
         *self.lock_error() = None;
@@ -148,6 +167,10 @@ impl ClickHouseDB {
     }
 
     fn write_rows(&self, rows: &[RowWithColumn]) -> Result<()> {
+        self.write_rows_at_height(rows, self.archive_height.load(Ordering::Relaxed))
+    }
+
+    fn write_rows_at_height(&self, rows: &[RowWithColumn], archive_height: u64) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
         }
@@ -162,7 +185,7 @@ impl ClickHouseDB {
             encode_string(&mut body, row.column.as_bytes());
             encode_string(&mut body, &row.row.key);
             encode_string(&mut body, &row.row.value);
-            body.extend_from_slice(&self.archive_height.load(Ordering::Relaxed).to_le_bytes());
+            body.extend_from_slice(&archive_height.to_le_bytes());
             body.push(u8::from(row.row.deleted));
             row_count += 1;
             if row_count >= self.config.max_insert_rows

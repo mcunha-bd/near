@@ -42,6 +42,8 @@ pub const GENESIS_HEIGHT_KEY: &[u8; 18] = b"GENESIS_HEIGHT_KEY";
 pub const GENESIS_STATE_ROOTS_KEY: &[u8; 19] = b"GENESIS_STATE_ROOTS";
 pub const GENESIS_CONGESTION_INFO_KEY: &[u8] = b"GENESIS_CONGESTION_INFO_KEY";
 pub const COLD_HEAD_KEY: &[u8; 9] = b"COLD_HEAD";
+/// Progress marker for an interrupted ClickHouse cold-store bootstrap.
+pub const CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY: &[u8] = b"CLICKHOUSE_BOOTSTRAP_PROGRESS";
 pub const STATE_SYNC_DUMP_KEY: &[u8; 15] = b"STATE_SYNC_DUMP";
 pub const STATE_SNAPSHOT_KEY: &[u8; 18] = b"STATE_SNAPSHOT_KEY";
 pub const GC_STOP_HEIGHT_KEY: &[u8; 14] = b"GC_STOP_HEIGHT";

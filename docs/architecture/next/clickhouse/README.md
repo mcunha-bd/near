@@ -31,6 +31,7 @@ source:
     "password_file": "clickhouse-password",
     "read_enabled": false,
     "write_enabled": true,
+    "bootstrap_from_local_cold_store": true,
     "connect_timeout": { "secs": 10, "nanos": 0 },
     "request_timeout": { "secs": 300, "nanos": 0 },
     "max_insert_rows": 10000,
@@ -40,11 +41,19 @@ source:
 ```
 
 On a legacy archive, the copier reads history from the archival RocksDB by
-finalized height. On an existing split archive, startup first bulk-streams the
-completed local cold RocksDB snapshot, writes its head marker last, and then
-resumes finalized-height copying through local hot+cold RocksDB. ClickHouse
-stores its own `COLD_HEAD`, making restarts resumable and independent of local
-cold-store progress.
+finalized height. On an existing split archive, the local RocksDB cold writer
+remains authoritative while a background ClickHouse actor bulk-streams it.
+It records the local cold head `H0`, checkpoints each bounded insert batch in
+ClickHouse, writes `HEAD` and `COLD_HEAD` as `H0` last, and only then enables
+the ClickHouse finalized-height tail. A restart resumes at the next key in the
+unfinished column for the same `H0`. This serializes ClickHouse writes while
+the node continues syncing and writing its local cold store. Rows written
+locally after `H0` can be replayed safely.
+
+Set `bootstrap_from_local_cold_store` to `false` only for a preloaded target or
+to replay the ClickHouse tail from genesis. For a disposable target, drop and
+recreate the configured table, leave this setting enabled, and restart neard;
+an empty table has no `HEAD`, so bootstrap starts again automatically.
 
 Monitor `near_archive.ingest_progress`, ClickHouse rejected-query logs, disk
 free space, merge backlog, and the existing nearcore cold-copy result metric.

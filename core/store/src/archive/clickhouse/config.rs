@@ -14,6 +14,10 @@ fn default_write_enabled() -> bool {
     true
 }
 
+fn default_bootstrap_from_local_cold_store() -> bool {
+    true
+}
+
 fn default_connect_timeout() -> Duration {
     Duration::seconds(10)
 }
@@ -52,6 +56,14 @@ pub struct ClickHouseArchiveConfig {
     /// Copy finalized archival rows to ClickHouse.
     #[serde(default = "default_write_enabled")]
     pub write_enabled: bool,
+    /// On an empty ClickHouse table, first import the existing local cold store.
+    ///
+    /// The import runs in the background and delays the ClickHouse tail writer
+    /// until it commits the local cold-store head. Disable this only when the
+    /// ClickHouse table is intentionally preloaded or tail replay from genesis
+    /// is desired.
+    #[serde(default = "default_bootstrap_from_local_cold_store")]
+    pub bootstrap_from_local_cold_store: bool,
     #[serde(default = "default_connect_timeout")]
     #[serde(with = "near_time::serde_duration_as_std")]
     pub connect_timeout: Duration,
@@ -103,6 +115,7 @@ mod tests {
             password_file: None,
             read_enabled: false,
             write_enabled: true,
+            bootstrap_from_local_cold_store: true,
             connect_timeout: default_connect_timeout(),
             request_timeout: default_request_timeout(),
             max_insert_rows: default_max_insert_rows(),

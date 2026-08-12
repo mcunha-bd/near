@@ -1,5 +1,6 @@
 use crate::metrics;
 use anyhow::{Result, anyhow};
+use borsh::{BorshDeserialize, BorshSerialize};
 use near_async::futures::{DelayedActionRunner, DelayedActionRunnerExt};
 use near_async::messaging::Actor;
 use near_async::time::Duration;
@@ -10,12 +11,13 @@ use near_primitives::errors::EpochError;
 use near_primitives::types::BlockHeight;
 use near_store::adapter::StoreAdapter;
 use near_store::archive::cold_storage::{
-    copy_all_cold_data, copy_state_to_cold, get_cold_head, update_cold_db, update_cold_head,
+    ColdStoreCopyProgress, copy_all_cold_data, copy_state_to_cold, get_cold_head, update_cold_db,
+    update_cold_head,
 };
 use near_store::config::SplitStorageConfig;
-use near_store::db::{ClickHouseDB, ColdDB};
+use near_store::db::{CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY, ClickHouseDB, ColdDB, Database};
 use near_store::{DBCol, FINAL_HEAD_KEY, Store, TAIL_KEY, set_genesis_height};
-use std::io::Error;
+use std::io::{self, Error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
@@ -31,6 +33,14 @@ enum ColdStoreCopyResult {
     /// A block older than the final head block was copied. There
     /// are more blocks that can be copied immediately.
     OtherBlockCopied,
+}
+
+#[derive(BorshDeserialize, BorshSerialize)]
+struct ClickHouseBootstrapProgress {
+    source_head: Tip,
+    completed_columns: u16,
+    last_key: Option<Vec<u8>>,
+    sequence: u64,
 }
 
 /// The ColdStoreError indicates what errors were encountered while copying a blocks and running sanity checks.
@@ -100,12 +110,17 @@ pub struct ColdStoreActor {
     keep_going: Arc<AtomicBool>,
     clickhouse_db: Option<Arc<ClickHouseDB>>,
     source_has_full_history: bool,
+    clickhouse_bootstrap_source: Option<Arc<ColdDB>>,
 }
 
 impl Actor for ColdStoreActor {
     fn start_actor(&mut self, ctx: &mut dyn DelayedActionRunner<Self>) {
         tracing::info!(target: "cold_store", "starting the cold store actor");
-        self.cold_store_loop(ctx);
+        if self.clickhouse_bootstrap_source.is_some() {
+            self.clickhouse_bootstrap_loop(ctx);
+        } else {
+            self.cold_store_loop(ctx);
+        }
     }
 }
 
@@ -120,6 +135,7 @@ impl ColdStoreActor {
         keep_going: Arc<AtomicBool>,
         clickhouse_db: Option<Arc<ClickHouseDB>>,
         source_has_full_history: bool,
+        clickhouse_bootstrap_source: Option<Arc<ColdDB>>,
     ) -> Self {
         debug_assert!(shard_tracker.tracks_non_empty_subset_of_shards());
         ColdStoreActor {
@@ -132,7 +148,117 @@ impl ColdStoreActor {
             keep_going,
             clickhouse_db,
             source_has_full_history,
+            clickhouse_bootstrap_source,
         }
+    }
+
+    fn clickhouse_bootstrap_loop(&mut self, ctx: &mut dyn DelayedActionRunner<Self>) {
+        if !self.keep_going.load(Ordering::Relaxed) {
+            tracing::debug!(target: "clickhouse_archive", "stopping clickhouse archive bootstrap");
+            return;
+        }
+
+        match self.bootstrap_clickhouse_archive() {
+            Ok(()) => {
+                self.clickhouse_bootstrap_source = None;
+                tracing::info!(target: "clickhouse_archive", "completed local cold store bootstrap");
+                self.cold_store_loop(ctx);
+            }
+            Err(error) => {
+                tracing::error!(target: "clickhouse_archive", ?error, "clickhouse archive bootstrap failed");
+                ctx.run_later(
+                    "clickhouse_archive_bootstrap",
+                    self.split_storage_config.cold_store_loop_sleep_duration,
+                    move |actor, ctx| actor.clickhouse_bootstrap_loop(ctx),
+                );
+            }
+        }
+    }
+
+    fn bootstrap_clickhouse_archive(&self) -> Result<(), ColdStoreError> {
+        let source_cold_db = self
+            .clickhouse_bootstrap_source
+            .as_ref()
+            .expect("clickhouse bootstrap source must be present");
+        let progress = self.read_clickhouse_bootstrap_progress()?;
+        let current_source_head =
+            get_cold_head(source_cold_db.as_ref())?.ok_or_else(|| ColdStoreError::Error {
+                message: "local cold store has no head to bootstrap".to_owned(),
+            })?;
+        let source_head = match progress.as_ref() {
+            Some(progress) => {
+                if current_source_head.height < progress.source_head.height
+                    || (current_source_head.height == progress.source_head.height
+                        && current_source_head.last_block_hash
+                            != progress.source_head.last_block_hash)
+                {
+                    return Err(ColdStoreError::Error {
+                        message:
+                            "local cold store no longer contains the clickhouse bootstrap head"
+                                .to_owned(),
+                    });
+                }
+                progress.source_head.clone()
+            }
+            None => current_source_head,
+        };
+        let completed_columns =
+            progress.as_ref().map_or(0, |progress| progress.completed_columns as usize);
+        let cold_column_count = DBCol::iter().filter(|col| col.is_cold()).count();
+        if completed_columns > cold_column_count {
+            return Err(ColdStoreError::Error {
+                message: "clickhouse bootstrap progress has too many completed columns".to_owned(),
+            });
+        }
+        let source_head_bytes = borsh::to_vec(&source_head)
+            .map_err(|error| ColdStoreError::Error { message: error.to_string() })?;
+        tracing::info!(
+            target: "clickhouse_archive",
+            height = source_head.height,
+            "bulk importing local cold store into clickhouse"
+        );
+        self.begin_clickhouse_height(source_head.height);
+        let mut sequence = progress.as_ref().map_or(0, |progress| progress.sequence);
+        let last_key = progress.and_then(|progress| progress.last_key);
+        copy_all_cold_data(
+            self.cold_db.as_ref(),
+            &source_cold_db.as_store(),
+            &source_head_bytes,
+            ColdStoreCopyProgress { completed_columns, last_key },
+            |progress| {
+                self.check_clickhouse_error().map_err(io::Error::other)?;
+                sequence = sequence.checked_add(1).ok_or_else(|| {
+                    io::Error::other("clickhouse bootstrap progress sequence overflow")
+                })?;
+                let progress = ClickHouseBootstrapProgress {
+                    source_head: source_head.clone(),
+                    completed_columns: progress
+                        .completed_columns
+                        .try_into()
+                        .map_err(|_| io::Error::other("too many clickhouse bootstrap columns"))?,
+                    last_key: progress.last_key,
+                    sequence,
+                };
+                let progress = borsh::to_vec(&progress)?;
+                self.clickhouse_db
+                    .as_ref()
+                    .expect("clickhouse bootstrap requires clickhouse database")
+                    .write_bootstrap_progress(progress, sequence)
+                    .map_err(io::Error::other)
+            },
+        )?;
+        self.check_clickhouse_error()
+    }
+
+    fn read_clickhouse_bootstrap_progress(
+        &self,
+    ) -> Result<Option<ClickHouseBootstrapProgress>, ColdStoreError> {
+        self.cold_db
+            .get_raw_bytes(DBCol::BlockMisc, CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY)
+            .as_deref()
+            .map(ClickHouseBootstrapProgress::try_from_slice)
+            .transpose()
+            .map_err(ColdStoreError::from)
     }
 
     // This method will copy data from hot storage to cold storage in a loop.
@@ -344,6 +470,7 @@ pub fn create_cold_store_actor(
         shard_tracker,
         None,
         false,
+        None,
     )
 }
 
@@ -366,26 +493,15 @@ pub fn create_clickhouse_archive_actor(
     };
     let cold_db = Arc::new(ColdDB::new(clickhouse_db.clone()));
 
-    clickhouse_db.begin_archive_height(genesis_height);
     let clickhouse_head = get_cold_head(cold_db.as_ref())?;
     if let Some(error) = clickhouse_db.take_last_error() {
         return Err(anyhow!(error));
     }
-    if clickhouse_head.is_none()
-        && let Some(source_cold_db) = migration_cold_db
-        && let Some(source_head) = get_cold_head(source_cold_db.as_ref())?
-    {
-        tracing::info!(
-            target: "clickhouse_archive",
-            height = source_head.height,
-            "bulk importing local cold store into clickhouse"
-        );
-        clickhouse_db.begin_archive_height(source_head.height);
-        copy_all_cold_data(cold_db.as_ref(), &source_cold_db.as_store())?;
-        if let Some(error) = clickhouse_db.take_last_error() {
-            return Err(anyhow!(error));
-        }
-    }
+    let clickhouse_bootstrap_source = clickhouse_head
+        .is_none()
+        .then_some(())
+        .filter(|()| clickhouse_db.bootstrap_from_local_cold_store())
+        .and(migration_cold_db.cloned());
 
     create_cold_store_actor_for_backend(
         save_trie_changes,
@@ -397,6 +513,7 @@ pub fn create_clickhouse_archive_actor(
         shard_tracker,
         Some(clickhouse_db),
         source_has_full_history,
+        clickhouse_bootstrap_source,
     )
 }
 
@@ -410,6 +527,7 @@ fn create_cold_store_actor_for_backend(
     shard_tracker: ShardTracker,
     clickhouse_db: Option<Arc<ClickHouseDB>>,
     source_has_full_history: bool,
+    clickhouse_bootstrap_source: Option<Arc<ColdDB>>,
 ) -> Result<Option<(ColdStoreActor, Arc<AtomicBool>)>> {
     if save_trie_changes != Some(true) {
         tracing::debug!(target: "cold_store", "not creating cold store actor because trie changes are not saved");
@@ -426,31 +544,37 @@ fn create_cold_store_actor_for_backend(
     let keep_going = Arc::new(AtomicBool::new(true));
     let keep_going_clone = keep_going.clone();
 
-    // Save the genesis height to cold storage
-    if let Some(database) = &clickhouse_db {
-        database.begin_archive_height(genesis_height);
-    }
-    let mut store_update = cold_db.as_store().store_update();
-    set_genesis_height(&mut store_update, &genesis_height);
-    store_update.commit();
-    if let Some(error) = clickhouse_db.as_ref().and_then(|database| database.take_last_error()) {
-        return Err(anyhow!(error));
+    if clickhouse_bootstrap_source.is_none() {
+        // Save the genesis height to cold storage.
+        if let Some(database) = &clickhouse_db {
+            database.begin_archive_height(genesis_height);
+        }
+        let mut store_update = cold_db.as_store().store_update();
+        set_genesis_height(&mut store_update, &genesis_height);
+        store_update.commit();
+        if let Some(error) = clickhouse_db.as_ref().and_then(|database| database.take_last_error())
+        {
+            return Err(anyhow!(error));
+        }
     }
 
     // Perform the sanity check before spawning the actor.
     // If the check fails when the node is starting it's better to just fail
     // fast and crash the node immediately.
-    let cold_store = cold_db.as_store().chain_store();
-    let cold_head_height = cold_store.head().map(|tip| tip.height).unwrap_or(genesis_height);
-    if let Some(error) = clickhouse_db.as_ref().and_then(|database| database.take_last_error()) {
-        return Err(anyhow!(error));
-    }
-    let hot_final_head_height =
-        hot_store.chain_store().final_head().map(|tip| tip.height).unwrap_or(genesis_height);
-    let hot_tail_height =
-        if source_has_full_history { genesis_height } else { hot_store.chain_store().tail() };
+    if clickhouse_bootstrap_source.is_none() {
+        let cold_store = cold_db.as_store().chain_store();
+        let cold_head_height = cold_store.head().map(|tip| tip.height).unwrap_or(genesis_height);
+        if let Some(error) = clickhouse_db.as_ref().and_then(|database| database.take_last_error())
+        {
+            return Err(anyhow!(error));
+        }
+        let hot_final_head_height =
+            hot_store.chain_store().final_head().map(|tip| tip.height).unwrap_or(genesis_height);
+        let hot_tail_height =
+            if source_has_full_history { genesis_height } else { hot_store.chain_store().tail() };
 
-    sanity_check(cold_head_height, hot_final_head_height, hot_tail_height)?;
+        sanity_check(cold_head_height, hot_final_head_height, hot_tail_height)?;
+    }
     debug_assert!(shard_tracker.tracks_non_empty_subset_of_shards());
 
     tracing::info!(target: "cold_store", "creating the cold store actor");
@@ -465,6 +589,7 @@ fn create_cold_store_actor_for_backend(
         keep_going_clone,
         clickhouse_db,
         source_has_full_history,
+        clickhouse_bootstrap_source,
     );
 
     Ok(Some((actor, keep_going)))

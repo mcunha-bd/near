@@ -18,6 +18,13 @@ use strum::IntoEnumIterator;
 type StoreKey = Vec<u8>;
 type StoreValue = Option<Vec<u8>>;
 
+/// Position of a resumable complete cold-store copy.
+#[derive(Clone, Debug)]
+pub struct ColdStoreCopyProgress {
+    pub completed_columns: usize,
+    pub last_key: Option<Vec<u8>>,
+}
+
 /// This trait is used on top of Store to calculate cold loop specific metrics,
 /// and implement conversion to errors for absent data.
 pub trait ColdMigrationStore {
@@ -492,43 +499,73 @@ pub fn copy_state_to_cold(cold_db: &ColdDB, hot_store: &Store) -> io::Result<()>
 
 /// Streams a complete local cold-store snapshot into another cold backend.
 ///
-/// `HEAD` is deliberately written last. An interrupted import therefore has
-/// no committed progress marker and can safely restart with idempotent writes.
-pub fn copy_all_cold_data(cold_db: &ColdDB, source_store: &Store) -> io::Result<()> {
+/// `HEAD` and `COLD_HEAD` are deliberately written last using `source_head`.
+/// This lets a local cold writer continue advancing during the import: rows
+/// after `source_head` may be copied early, but cannot become visible until
+/// the ClickHouse tail writer replays them. `on_progress` runs after every
+/// bounded insert batch, so an interrupted import can resume from its last
+/// copied key.
+pub fn copy_all_cold_data(
+    cold_db: &ColdDB,
+    source_store: &Store,
+    source_head: &[u8],
+    progress: ColdStoreCopyProgress,
+    mut on_progress: impl FnMut(ColdStoreCopyProgress) -> io::Result<()>,
+) -> io::Result<()> {
     #[cfg(not(test))]
     const BATCH_SIZE_BYTES: usize = 500_000_000;
     #[cfg(test)]
     const BATCH_SIZE_BYTES: usize = 1024;
 
     let _span = tracing::debug_span!(target: "cold_store", "copy_all_cold_data");
-    let mut head = None;
-    for col in DBCol::iter().filter(|col| col.is_cold()) {
+    for (column_index, col) in DBCol::iter().filter(|col| col.is_cold()).enumerate() {
+        if column_index < progress.completed_columns {
+            continue;
+        }
+        let resume_key = (column_index == progress.completed_columns)
+            .then_some(progress.last_key.as_deref())
+            .flatten();
         let mut transaction = DBTransaction::new();
         let mut batch_bytes = 0;
-        for (key, value) in source_store.iter(col) {
-            if col == DBCol::BlockMisc && key.as_ref() == HEAD_KEY {
-                head = Some(value.to_vec());
+        let mut last_key = None;
+        let iterator = match resume_key {
+            Some(key) => source_store.iter_range(col, Some(key), None),
+            None => source_store.iter(col),
+        };
+        for (key, value) in iterator {
+            if resume_key.is_some_and(|resume_key| key.as_ref() == resume_key) {
+                continue;
+            }
+            if col == DBCol::BlockMisc
+                && (key.as_ref() == HEAD_KEY || key.as_ref() == COLD_HEAD_KEY)
+            {
                 continue;
             }
             metrics::COLD_MIGRATION_READS.with_label_values(&[<&str>::from(col)]).inc();
             batch_bytes += key.len() + value.len();
             rc_aware_set(&mut transaction, col, key.to_vec(), value.to_vec());
+            last_key = Some(key.to_vec());
             if batch_bytes >= BATCH_SIZE_BYTES {
                 cold_db.write(transaction);
+                on_progress(ColdStoreCopyProgress {
+                    completed_columns: column_index,
+                    last_key: last_key.clone(),
+                })?;
                 transaction = DBTransaction::new();
                 batch_bytes = 0;
             }
         }
         if !transaction.ops.is_empty() {
             cold_db.write(transaction);
+            on_progress(ColdStoreCopyProgress { completed_columns: column_index, last_key })?;
         }
+        on_progress(ColdStoreCopyProgress { completed_columns: column_index + 1, last_key: None })?;
     }
 
-    if let Some(head) = head {
-        let mut transaction = DBTransaction::new();
-        transaction.set(DBCol::BlockMisc, HEAD_KEY.to_vec(), head);
-        cold_db.write(transaction);
-    }
+    let mut transaction = DBTransaction::new();
+    transaction.set(DBCol::BlockMisc, HEAD_KEY.to_vec(), source_head.to_vec());
+    transaction.set(DBCol::BlockMisc, COLD_HEAD_KEY.to_vec(), source_head.to_vec());
+    cold_db.write(transaction);
     Ok(())
 }
 
@@ -790,9 +827,11 @@ impl ColdMigrationStore for Store {
 
 #[cfg(test)]
 mod test {
-    use super::{StoreKey, combine_keys, copy_state_to_cold};
+    use super::{
+        ColdStoreCopyProgress, StoreKey, combine_keys, copy_all_cold_data, copy_state_to_cold,
+    };
     use crate::columns::DBKeyType;
-    use crate::db::{ColdDB, Database};
+    use crate::db::{ColdDB, DBTransaction, Database};
     use crate::metadata::{DB_VERSION, DbKind};
     use crate::test_utils::create_test_node_storage_with_cold;
     use crate::{DBCol, Store};
@@ -830,6 +869,57 @@ mod test {
             let key = format!("key{:04}", i).into_bytes();
             assert!(cold_keys.contains(&key), "missing key {:?} in cold", key);
         }
+    }
+
+    #[test]
+    fn test_copy_all_cold_data_resumes_from_last_key() {
+        let (_source_storage, _source_hot, source_cold) =
+            create_test_node_storage_with_cold(DB_VERSION, DbKind::Hot);
+        let (_target_storage, _target_hot, target_cold) =
+            create_test_node_storage_with_cold(DB_VERSION, DbKind::Hot);
+        let source_cold_db = ColdDB::new(source_cold as Arc<dyn Database>);
+        let target_cold_db = ColdDB::new(target_cold as Arc<dyn Database>);
+        let source_store = source_cold_db.as_store();
+
+        let mut update = DBTransaction::new();
+        for index in 0..10 {
+            update.set(DBCol::Block, format!("block{index:02}").into_bytes(), vec![index; 400]);
+        }
+        source_cold_db.write(update);
+
+        let block_column_index =
+            DBCol::iter().filter(|col| col.is_cold()).position(|col| col == DBCol::Block).unwrap();
+        let mut progress = ColdStoreCopyProgress { completed_columns: 0, last_key: None };
+        let error = copy_all_cold_data(
+            &target_cold_db,
+            &source_store,
+            b"source head",
+            progress.clone(),
+            |next_progress| {
+                progress = next_progress;
+                if progress.completed_columns == block_column_index && progress.last_key.is_some() {
+                    return Err(std::io::Error::other("simulated interruption"));
+                }
+                Ok(())
+            },
+        );
+        assert!(error.is_err());
+        assert_eq!(progress.completed_columns, block_column_index);
+        assert!(progress.last_key.is_some());
+
+        copy_all_cold_data(&target_cold_db, &source_store, b"source head", progress, |_| Ok(()))
+            .unwrap();
+
+        let source_rows: Vec<_> = source_store
+            .iter(DBCol::Block)
+            .map(|(key, value)| (key.into_vec(), value.into_vec()))
+            .collect();
+        let target_rows: Vec<_> = target_cold_db
+            .as_store()
+            .iter(DBCol::Block)
+            .map(|(key, value)| (key.into_vec(), value.into_vec()))
+            .collect();
+        assert_eq!(target_rows, source_rows);
     }
 
     #[test]
