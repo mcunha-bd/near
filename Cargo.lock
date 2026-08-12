@@ -4932,6 +4932,7 @@ dependencies = [
  "rand_chacha 0.3.1",
  "rayon",
  "reed-solomon-erasure",
+ "reqwest 0.13.2",
  "rlimit",
  "rocksdb",
  "serde",

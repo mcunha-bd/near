@@ -183,6 +183,9 @@ pub struct StoreOpener<'a> {
     /// Opener for an instance of cloud storage if one was configured.
     cloud: Option<CloudStorageOpener>,
 
+    /// Whether a non-local archive backend will be attached after RocksDB opens.
+    remote_archive: bool,
+
     /// Whether this opener is for a state snapshot database.
     ///
     /// State snapshot DBs only contain a subset of columns (see
@@ -224,12 +227,18 @@ impl<'a> StoreOpener<'a> {
             cold_store_config.map(|config| DBOpener::new(home_dir, config, Temperature::Cold));
         let cloud = cloud_storage_context
             .map(|context| CloudStorageOpener::new(context, BucketConfig::canonical()));
-        Self { hot, cold, migrator: None, cloud, is_snapshot: false }
+        Self { hot, cold, migrator: None, cloud, remote_archive: false, is_snapshot: false }
     }
 
     /// Returns true if this opener is for an archival node.
     fn is_archive(&self) -> bool {
-        self.cold.is_some() || self.cloud.is_some()
+        self.cold.is_some() || self.cloud.is_some() || self.remote_archive
+    }
+
+    /// Marks this opener as archival when its cold backend is attached separately.
+    pub fn with_remote_archive(mut self) -> Self {
+        self.remote_archive = true;
+        self
     }
 
     /// Configures the opener with specified [`StoreMigrator`].

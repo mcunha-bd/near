@@ -1,0 +1,36 @@
+<!-- Merge this fragment under <clickhouse> in the server configuration. -->
+<clickhouse>
+    <storage_configuration>
+        <disks>
+            <archive_hot>
+                <type>local</type>
+                <path>/var/lib/clickhouse-hot/</path>
+            </archive_hot>
+            <archive_cold_1>
+                <type>local</type>
+                <path>/var/lib/clickhouse-cold-1/</path>
+            </archive_cold_1>
+            <archive_cold_2>
+                <type>local</type>
+                <path>/var/lib/clickhouse-cold-2/</path>
+            </archive_cold_2>
+        </disks>
+        <policies>
+            <near_archive_tiered>
+                <volumes>
+                    <hot>
+                        <disk>archive_hot</disk>
+                        <!-- Large merged parts move to the cold volume. -->
+                        <max_data_part_size_bytes>10737418240</max_data_part_size_bytes>
+                    </hot>
+                    <cold>
+                        <!-- Multiple disks in a volume are balanced by ClickHouse. -->
+                        <disk>archive_cold_1</disk>
+                        <disk>archive_cold_2</disk>
+                    </cold>
+                </volumes>
+                <move_factor>0.15</move_factor>
+            </near_archive_tiered>
+        </policies>
+    </storage_configuration>
+</clickhouse>

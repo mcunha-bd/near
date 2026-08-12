@@ -74,3 +74,7 @@ costs-*.txt
 names-to-stats.txt
 data_dump_*.bin
 .venv
+
+# MemPalace per-project files (issue #185)
+mempalace.yaml
+entities.json

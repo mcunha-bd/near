@@ -32,6 +32,7 @@ parking_lot.workspace = true
 rand.workspace = true
 rayon.workspace = true
 reed-solomon-erasure.workspace = true
+reqwest.workspace = true
 rlimit.workspace = true
 rocksdb = { workspace = true, features = [
     "snappy",

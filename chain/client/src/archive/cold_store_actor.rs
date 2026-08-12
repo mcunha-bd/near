@@ -1,4 +1,5 @@
 use crate::metrics;
+use anyhow::{Result, anyhow};
 use near_async::futures::{DelayedActionRunner, DelayedActionRunnerExt};
 use near_async::messaging::Actor;
 use near_async::time::Duration;
@@ -9,12 +10,15 @@ use near_primitives::errors::EpochError;
 use near_primitives::types::BlockHeight;
 use near_store::adapter::StoreAdapter;
 use near_store::archive::cold_storage::{
-    copy_state_to_cold, get_cold_head, update_cold_db, update_cold_head,
+    copy_all_cold_data, copy_state_to_cold, get_cold_head, update_cold_db, update_cold_head,
 };
 use near_store::config::SplitStorageConfig;
-use near_store::db::ColdDB;
+use near_store::db::{ClickHouseDB, ColdDB};
 use near_store::{DBCol, FINAL_HEAD_KEY, Store, TAIL_KEY, set_genesis_height};
-use std::sync::{Arc, atomic::AtomicBool};
+use std::io::Error;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration as StdDuration, Instant};
 
 /// The ColdStoreCopyResult indicates if and what block was copied.
 #[derive(Debug)]
@@ -56,8 +60,8 @@ pub enum ColdStoreError {
     Error { message: String },
 }
 
-impl From<std::io::Error> for ColdStoreError {
-    fn from(error: std::io::Error) -> Self {
+impl From<Error> for ColdStoreError {
+    fn from(error: Error) -> Self {
         ColdStoreError::Error { message: error.to_string() }
     }
 }
@@ -68,9 +72,7 @@ impl From<EpochError> for ColdStoreError {
     }
 }
 
-fn cold_store_copy_result_to_string(
-    result: &anyhow::Result<ColdStoreCopyResult, ColdStoreError>,
-) -> &str {
+fn cold_store_copy_result_to_string(result: &Result<ColdStoreCopyResult, ColdStoreError>) -> &str {
     match result {
         Err(ColdStoreError::ColdHeadBehindHotTailError { .. }) => "cold_head_behind_hot_tail_error",
         Err(ColdStoreError::ColdHeadAheadOfFinalHeadError { .. }) => {
@@ -96,6 +98,8 @@ pub struct ColdStoreActor {
     epoch_manager: Arc<dyn EpochManagerAdapter>,
     shard_tracker: ShardTracker,
     keep_going: Arc<AtomicBool>,
+    clickhouse_db: Option<Arc<ClickHouseDB>>,
+    source_has_full_history: bool,
 }
 
 impl Actor for ColdStoreActor {
@@ -114,6 +118,8 @@ impl ColdStoreActor {
         epoch_manager: Arc<dyn EpochManagerAdapter>,
         shard_tracker: ShardTracker,
         keep_going: Arc<AtomicBool>,
+        clickhouse_db: Option<Arc<ClickHouseDB>>,
+        source_has_full_history: bool,
     ) -> Self {
         debug_assert!(shard_tracker.tracks_non_empty_subset_of_shards());
         ColdStoreActor {
@@ -124,6 +130,8 @@ impl ColdStoreActor {
             epoch_manager,
             shard_tracker,
             keep_going,
+            clickhouse_db,
+            source_has_full_history,
         }
     }
 
@@ -132,7 +140,7 @@ impl ColdStoreActor {
     // Once the cold head reaches the final head it will sleep for one second before
     // trying to copy data at the next height.
     fn cold_store_loop(&self, ctx: &mut dyn DelayedActionRunner<Self>) {
-        if !self.keep_going.load(std::sync::atomic::Ordering::Relaxed) {
+        if !self.keep_going.load(Ordering::Relaxed) {
             tracing::debug!(target: "cold_store", "stopping the cold store loop");
             return;
         }
@@ -152,14 +160,14 @@ impl ColdStoreActor {
         });
     }
 
-    fn cold_store_loop_impl(&self) -> anyhow::Result<ColdStoreCopyResult, ColdStoreError> {
-        let instant = std::time::Instant::now();
+    fn cold_store_loop_impl(&self) -> Result<ColdStoreCopyResult, ColdStoreError> {
+        let instant = Instant::now();
         let result = self.cold_store_copy();
         let duration = instant.elapsed();
 
         let result_string = cold_store_copy_result_to_string(&result);
         metrics::COLD_STORE_COPY_RESULT.with_label_values(&[result_string]).inc();
-        if duration > std::time::Duration::from_secs(1) {
+        if duration > StdDuration::from_secs(1) {
             tracing::debug!(target: "cold_store", ?duration, "cold store copy completed");
         }
 
@@ -186,8 +194,9 @@ impl ColdStoreActor {
     /// Checks if cold store head is behind the final head and if so copies data
     /// for the next available produced block after current cold store head.
     /// Updates cold store head after.
-    fn cold_store_copy(&self) -> anyhow::Result<ColdStoreCopyResult, ColdStoreError> {
+    fn cold_store_copy(&self) -> Result<ColdStoreCopyResult, ColdStoreError> {
         let cold_head = get_cold_head(&self.cold_db)?;
+        self.check_clickhouse_error()?;
 
         // If cold storage is not initialized, copy genesis state first.
         // Genesis state is written directly to the State column (not via
@@ -197,7 +206,9 @@ impl ColdStoreActor {
         // below when it processes genesis height.
         if cold_head.is_none() {
             tracing::info!(target: "cold_store", "cold store not initialized, copying genesis state");
+            self.begin_clickhouse_height(self.genesis_height);
             copy_state_to_cold(&self.cold_db, &self.hot_store)?;
+            self.check_clickhouse_error()?;
         }
 
         // When cold HEAD is not set, start copying from genesis height.
@@ -215,7 +226,11 @@ impl ColdStoreActor {
         // TAIL not being set is not an error.
         // Archive dbs don't have TAIL, that means that they have all data from genesis_height.
         let hot_tail = self.hot_store.get_ser::<u64>(DBCol::BlockMisc, TAIL_KEY);
-        let hot_tail_height = hot_tail.unwrap_or(self.genesis_height);
+        let hot_tail_height = if self.source_has_full_history {
+            self.genesis_height
+        } else {
+            hot_tail.unwrap_or(self.genesis_height)
+        };
 
         let _span = tracing::debug_span!(target: "cold_store", "cold_store_copy", cold_head_height, hot_final_head_height, hot_tail_height).entered();
 
@@ -263,6 +278,8 @@ impl ColdStoreActor {
         // can copy child shard state insertions.
         let resharding_block_hash = is_resharding_boundary.then_some(prev_hash);
 
+        self.begin_clickhouse_height(next_height);
+
         update_cold_db(
             &self.cold_db,
             &self.hot_store,
@@ -272,8 +289,10 @@ impl ColdStoreActor {
             resharding_block_hash,
             self.split_storage_config.num_cold_store_read_threads,
         )?;
+        self.check_clickhouse_error()?;
 
         update_cold_head(&self.cold_db, &self.hot_store, &next_height)?;
+        self.check_clickhouse_error()?;
 
         let result = if next_height >= hot_final_head_height {
             Ok(ColdStoreCopyResult::LatestBlockCopied)
@@ -288,6 +307,19 @@ impl ColdStoreActor {
     pub fn get_cold_db(&self) -> Arc<ColdDB> {
         self.cold_db.clone()
     }
+
+    fn begin_clickhouse_height(&self, height: BlockHeight) {
+        if let Some(clickhouse_db) = &self.clickhouse_db {
+            clickhouse_db.begin_archive_height(height);
+        }
+    }
+
+    fn check_clickhouse_error(&self) -> Result<(), ColdStoreError> {
+        if let Some(error) = self.clickhouse_db.as_ref().and_then(|db| db.take_last_error()) {
+            return Err(ColdStoreError::Error { message: error });
+        }
+        Ok(())
+    }
 }
 
 /// Creates the cold store actor and keep_going handle if cold store is configured.
@@ -301,13 +333,90 @@ pub fn create_cold_store_actor(
     cold_db: Option<&Arc<ColdDB>>,
     epoch_manager: Arc<EpochManagerHandle>,
     shard_tracker: ShardTracker,
-) -> anyhow::Result<Option<(ColdStoreActor, Arc<AtomicBool>)>> {
+) -> Result<Option<(ColdStoreActor, Arc<AtomicBool>)>> {
+    create_cold_store_actor_for_backend(
+        save_trie_changes,
+        split_storage_config,
+        genesis_height,
+        hot_store,
+        cold_db.cloned(),
+        epoch_manager,
+        shard_tracker,
+        None,
+        false,
+    )
+}
+
+/// Creates a second finalized-height copier backed by ClickHouse.
+pub fn create_clickhouse_archive_actor(
+    save_trie_changes: Option<bool>,
+    split_storage_config: &SplitStorageConfig,
+    genesis_height: BlockHeight,
+    hot_store: Store,
+    clickhouse_db: Option<&Arc<ClickHouseDB>>,
+    epoch_manager: Arc<EpochManagerHandle>,
+    shard_tracker: ShardTracker,
+    source_has_full_history: bool,
+    migration_cold_db: Option<&Arc<ColdDB>>,
+) -> Result<Option<(ColdStoreActor, Arc<AtomicBool>)>> {
+    let Some(clickhouse_db) = clickhouse_db.filter(|database| database.write_enabled()).cloned()
+    else {
+        tracing::debug!(target: "clickhouse_archive", "not creating clickhouse archive actor because writes are not configured");
+        return Ok(None);
+    };
+    let cold_db = Arc::new(ColdDB::new(clickhouse_db.clone()));
+
+    clickhouse_db.begin_archive_height(genesis_height);
+    let clickhouse_head = get_cold_head(cold_db.as_ref())?;
+    if let Some(error) = clickhouse_db.take_last_error() {
+        return Err(anyhow!(error));
+    }
+    if clickhouse_head.is_none()
+        && let Some(source_cold_db) = migration_cold_db
+        && let Some(source_head) = get_cold_head(source_cold_db.as_ref())?
+    {
+        tracing::info!(
+            target: "clickhouse_archive",
+            height = source_head.height,
+            "bulk importing local cold store into clickhouse"
+        );
+        clickhouse_db.begin_archive_height(source_head.height);
+        copy_all_cold_data(cold_db.as_ref(), &source_cold_db.as_store())?;
+        if let Some(error) = clickhouse_db.take_last_error() {
+            return Err(anyhow!(error));
+        }
+    }
+
+    create_cold_store_actor_for_backend(
+        save_trie_changes,
+        split_storage_config,
+        genesis_height,
+        hot_store,
+        Some(cold_db),
+        epoch_manager,
+        shard_tracker,
+        Some(clickhouse_db),
+        source_has_full_history,
+    )
+}
+
+fn create_cold_store_actor_for_backend(
+    save_trie_changes: Option<bool>,
+    split_storage_config: &SplitStorageConfig,
+    genesis_height: BlockHeight,
+    hot_store: Store,
+    cold_db: Option<Arc<ColdDB>>,
+    epoch_manager: Arc<EpochManagerHandle>,
+    shard_tracker: ShardTracker,
+    clickhouse_db: Option<Arc<ClickHouseDB>>,
+    source_has_full_history: bool,
+) -> Result<Option<(ColdStoreActor, Arc<AtomicBool>)>> {
     if save_trie_changes != Some(true) {
         tracing::debug!(target: "cold_store", "not creating cold store actor because trie changes are not saved");
         return Ok(None);
     }
     let cold_db = match cold_db {
-        Some(cold_db) => cold_db.clone(),
+        Some(cold_db) => cold_db,
         None => {
             tracing::debug!(target: "cold_store", "not creating the cold store actor because cold store is not configured");
             return Ok(None);
@@ -318,18 +427,28 @@ pub fn create_cold_store_actor(
     let keep_going_clone = keep_going.clone();
 
     // Save the genesis height to cold storage
+    if let Some(database) = &clickhouse_db {
+        database.begin_archive_height(genesis_height);
+    }
     let mut store_update = cold_db.as_store().store_update();
     set_genesis_height(&mut store_update, &genesis_height);
     store_update.commit();
+    if let Some(error) = clickhouse_db.as_ref().and_then(|database| database.take_last_error()) {
+        return Err(anyhow!(error));
+    }
 
     // Perform the sanity check before spawning the actor.
     // If the check fails when the node is starting it's better to just fail
     // fast and crash the node immediately.
     let cold_store = cold_db.as_store().chain_store();
     let cold_head_height = cold_store.head().map(|tip| tip.height).unwrap_or(genesis_height);
+    if let Some(error) = clickhouse_db.as_ref().and_then(|database| database.take_last_error()) {
+        return Err(anyhow!(error));
+    }
     let hot_final_head_height =
         hot_store.chain_store().final_head().map(|tip| tip.height).unwrap_or(genesis_height);
-    let hot_tail_height = hot_store.chain_store().tail();
+    let hot_tail_height =
+        if source_has_full_history { genesis_height } else { hot_store.chain_store().tail() };
 
     sanity_check(cold_head_height, hot_final_head_height, hot_tail_height)?;
     debug_assert!(shard_tracker.tracks_non_empty_subset_of_shards());
@@ -344,6 +463,8 @@ pub fn create_cold_store_actor(
         epoch_manager,
         shard_tracker,
         keep_going_clone,
+        clickhouse_db,
+        source_has_full_history,
     );
 
     Ok(Some((actor, keep_going)))
@@ -356,7 +477,7 @@ fn sanity_check(
     cold_head_height: u64,
     hot_final_head_height: u64,
     hot_tail_height: u64,
-) -> anyhow::Result<(), ColdStoreError> {
+) -> Result<(), ColdStoreError> {
     // We should only copy final blocks to cold storage.
     if cold_head_height > hot_final_head_height {
         return Err(ColdStoreError::ColdHeadAheadOfFinalHeadError {

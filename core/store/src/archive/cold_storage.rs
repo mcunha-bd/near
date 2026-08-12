@@ -490,6 +490,48 @@ pub fn copy_state_to_cold(cold_db: &ColdDB, hot_store: &Store) -> io::Result<()>
     Ok(())
 }
 
+/// Streams a complete local cold-store snapshot into another cold backend.
+///
+/// `HEAD` is deliberately written last. An interrupted import therefore has
+/// no committed progress marker and can safely restart with idempotent writes.
+pub fn copy_all_cold_data(cold_db: &ColdDB, source_store: &Store) -> io::Result<()> {
+    #[cfg(not(test))]
+    const BATCH_SIZE_BYTES: usize = 500_000_000;
+    #[cfg(test)]
+    const BATCH_SIZE_BYTES: usize = 1024;
+
+    let _span = tracing::debug_span!(target: "cold_store", "copy_all_cold_data");
+    let mut head = None;
+    for col in DBCol::iter().filter(|col| col.is_cold()) {
+        let mut transaction = DBTransaction::new();
+        let mut batch_bytes = 0;
+        for (key, value) in source_store.iter(col) {
+            if col == DBCol::BlockMisc && key.as_ref() == HEAD_KEY {
+                head = Some(value.to_vec());
+                continue;
+            }
+            metrics::COLD_MIGRATION_READS.with_label_values(&[<&str>::from(col)]).inc();
+            batch_bytes += key.len() + value.len();
+            rc_aware_set(&mut transaction, col, key.to_vec(), value.to_vec());
+            if batch_bytes >= BATCH_SIZE_BYTES {
+                cold_db.write(transaction);
+                transaction = DBTransaction::new();
+                batch_bytes = 0;
+            }
+        }
+        if !transaction.ops.is_empty() {
+            cold_db.write(transaction);
+        }
+    }
+
+    if let Some(head) = head {
+        let mut transaction = DBTransaction::new();
+        transaction.set(DBCol::BlockMisc, HEAD_KEY.to_vec(), head);
+        cold_db.write(transaction);
+    }
+    Ok(())
+}
+
 // The copy_state_from_store function depends on the state nodes to be present
 // in the trie changes. This isn't the case for genesis so instead this method
 // can be used to copy the genesis records from hot to cold.

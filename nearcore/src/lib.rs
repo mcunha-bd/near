@@ -26,7 +26,9 @@ use near_client::adapter::client_sender_for_network;
 use near_client::archive::cloud_archival_writer::{
     CloudArchivalWriterHandle, create_cloud_archival_writer,
 };
-use near_client::archive::cold_store_actor::create_cold_store_actor;
+use near_client::archive::cold_store_actor::{
+    create_clickhouse_archive_actor, create_cold_store_actor,
+};
 use near_client::client_actor::ShutdownReason;
 use near_client::gc_actor::GCActor;
 use near_client::spice::chunk_executor_actor::ChunkExecutorActor;
@@ -47,6 +49,7 @@ use near_primitives::genesis::GenesisId;
 use near_primitives::types::EpochId;
 use near_primitives::version::PROTOCOL_VERSION;
 use near_store::adapter::StoreAdapter as _;
+use near_store::db::ClickHouseDB;
 use near_store::db::metadata::DbKind;
 use near_store::genesis::initialize_sharded_genesis_state;
 use near_store::metrics::spawn_db_metrics_loop;
@@ -100,14 +103,17 @@ pub fn get_default_home() -> PathBuf {
 // `archive` config option and `DbKind` — maybe it can be simplified.
 pub fn open_storage(home_dir: &Path, near_config: &NearConfig) -> anyhow::Result<NodeStorage> {
     let migrator = migrations::Migrator::new(near_config, home_dir);
-    let opener = NodeStorage::opener(
+    let mut opener = NodeStorage::opener(
         home_dir,
         &near_config.config.store,
         near_config.config.cold_store.as_ref(),
         near_config.cloud_storage_context(),
-    )
-    .with_migrator(&migrator);
-    let storage = match opener.open() {
+    );
+    if near_config.config.clickhouse_archival.is_some() {
+        opener = opener.with_remote_archive();
+    }
+    let opener = opener.with_migrator(&migrator);
+    let mut storage = match opener.open() {
         Ok(storage) => Ok(storage),
         Err(StoreOpenerError::IO(err)) => {
             Err(anyhow::anyhow!("{err}"))
@@ -192,9 +198,15 @@ pub fn open_storage(home_dir: &Path, near_config: &NearConfig) -> anyhow::Result
         },
     }.with_context(|| format!("unable to open database at {}", opener.path().display()))?;
 
+    if let Some(config) = near_config.config.clickhouse_archival.clone() {
+        let clickhouse =
+            ClickHouseDB::open(config, near_config.genesis.config.chain_id.clone(), home_dir)?;
+        storage.attach_clickhouse(Arc::new(clickhouse));
+    }
+
     assert_eq!(
         near_config.config.archive,
-        storage.is_local_archive() || storage.is_cloud_archive()
+        storage.is_local_archive() || storage.is_cloud_archive() || storage.is_clickhouse_archive()
     );
     Ok(storage)
 }
@@ -206,8 +218,13 @@ fn get_split_store(config: &NearConfig, storage: &NodeStorage) -> anyhow::Result
         return Ok(None);
     }
 
-    // SplitStore should only be used if cold store is configured.
-    if config.config.cold_store.is_none() {
+    // SplitStore should only be used if a readable cold store is configured.
+    let clickhouse_reads = config
+        .config
+        .clickhouse_archival
+        .as_ref()
+        .is_some_and(|clickhouse| clickhouse.read_enabled);
+    if config.config.cold_store.is_none() && !clickhouse_reads {
         return Ok(None);
     }
 
@@ -219,7 +236,7 @@ fn get_split_store(config: &NearConfig, storage: &NodeStorage) -> anyhow::Result
     // SplitStore should only be used if the migration is finished. The
     // migration to cold store is finished when the db kind of the hot store is
     // changed from Archive to Hot.
-    if storage.get_hot_store().get_db_kind() != Some(DbKind::Hot) {
+    if storage.get_hot_store().get_db_kind() != Some(DbKind::Hot) && !clickhouse_reads {
         return Ok(None);
     }
 
@@ -349,6 +366,8 @@ pub struct NearNode {
     /// The cold_store_loop_handle will only be set if the cold store is configured.
     /// It's a handle to control the cold store actor that copies data from the hot store to the cold store.
     pub cold_store_loop_handle: Option<Arc<AtomicBool>>,
+    /// Controls the finalized-height copier writing to ClickHouse.
+    pub clickhouse_archive_loop_handle: Option<Arc<AtomicBool>>,
     /// The `cloud_archival_handle` will only be set if the cloud archival writer is configured. It's a handle
     /// to control the cloud archival actor that archives data from the hot store to the cloud archival.
     pub cloud_archival_writer_handle: Option<CloudArchivalWriterHandle>,
@@ -471,6 +490,27 @@ pub async fn start_with_config_and_synchronization_impl(
     )?;
     let cold_store_loop_handle = if let Some((actor, keep_going)) = result {
         let _cold_store_addr = actor_system.spawn_tokio_actor(actor);
+        Some(keep_going)
+    } else {
+        None
+    };
+
+    let clickhouse_source_has_full_history = storage.has_cold();
+    let clickhouse_source =
+        storage.get_local_split_store().unwrap_or_else(|| storage.get_hot_store());
+    let clickhouse_result = create_clickhouse_archive_actor(
+        config.config.save_trie_changes,
+        &config.config.split_storage.clone().unwrap_or_default(),
+        config.genesis.config.genesis_height,
+        clickhouse_source,
+        storage.get_clickhouse_storage(),
+        epoch_manager.clone(),
+        shard_tracker.clone(),
+        clickhouse_source_has_full_history,
+        storage.cold_db(),
+    )?;
+    let clickhouse_archive_loop_handle = if let Some((actor, keep_going)) = clickhouse_result {
+        let _clickhouse_archive_addr = actor_system.spawn_tokio_actor(actor);
         Some(keep_going)
     } else {
         None
@@ -846,6 +886,7 @@ pub async fn start_with_config_and_synchronization_impl(
         #[cfg(feature = "tx_generator")]
         tx_generator,
         cold_store_loop_handle,
+        clickhouse_archive_loop_handle,
         cloud_archival_writer_handle,
         resharding_handle,
         shard_tracker,

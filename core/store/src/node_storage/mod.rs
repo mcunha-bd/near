@@ -2,7 +2,7 @@ pub(super) mod opener;
 
 use crate::archive::cloud_storage::CloudStorage;
 use crate::archive::cloud_storage::config::CloudStorageContext;
-use crate::db::{Database, SplitDB, metadata};
+use crate::db::{ClickHouseDB, ColdDB, Database, SplitDB, metadata};
 use crate::{Store, StoreConfig};
 use opener::StoreOpener;
 use std::str::FromStr;
@@ -39,8 +39,10 @@ impl FromStr for Temperature {
 /// users will want to use one of the above via the Store abstraction.
 pub struct NodeStorage {
     hot_storage: Arc<dyn Database>,
-    cold_storage: Option<Arc<crate::db::ColdDB>>,
+    cold_storage: Option<Arc<ColdDB>>,
     cloud_storage: Option<Arc<CloudStorage>>,
+    clickhouse_storage: Option<Arc<ClickHouseDB>>,
+    clickhouse_cold_storage: Option<Arc<ColdDB>>,
 }
 
 impl NodeStorage {
@@ -84,7 +86,13 @@ impl NodeStorage {
             None
         };
 
-        Self { hot_storage, cold_storage: cold_db, cloud_storage: None }
+        Self {
+            hot_storage,
+            cold_storage: cold_db,
+            cloud_storage: None,
+            clickhouse_storage: None,
+            clickhouse_cold_storage: None,
+        }
     }
 
     /// Constructs new object backed by given database.
@@ -97,7 +105,13 @@ impl NodeStorage {
     /// possibly [`crate::test_utils::create_test_store`] (depending whether you
     /// need [`NodeStorage`] or [`Store`] object.
     pub fn new(storage: Arc<dyn Database>) -> Self {
-        Self { hot_storage: storage, cold_storage: None, cloud_storage: None }
+        Self {
+            hot_storage: storage,
+            cold_storage: None,
+            cloud_storage: None,
+            clickhouse_storage: None,
+            clickhouse_cold_storage: None,
+        }
     }
 }
 
@@ -137,6 +151,10 @@ impl NodeStorage {
         self.cloud_storage.as_ref()
     }
 
+    pub fn get_clickhouse_storage(&self) -> Option<&Arc<ClickHouseDB>> {
+        self.clickhouse_storage.as_ref()
+    }
+
     /// Returns an instance of recovery store. The recovery store is only available in archival
     /// nodes with split storage configured.
     ///
@@ -161,10 +179,17 @@ impl NodeStorage {
         self.get_split_db().map(|split_db| Store::new(split_db))
     }
 
-    pub fn get_split_db(&self) -> Option<Arc<SplitDB>> {
+    /// Returns a split store backed specifically by the local RocksDB cold store.
+    /// This is used while migrating an existing split archive to another backend.
+    pub fn get_local_split_store(&self) -> Option<Store> {
         self.cold_storage
             .as_ref()
-            .map(|cold_db| SplitDB::new(self.hot_storage.clone(), cold_db.clone()))
+            .map(|cold_db| Store::new(SplitDB::new(self.hot_storage.clone(), cold_db.clone())))
+    }
+
+    pub fn get_split_db(&self) -> Option<Arc<SplitDB>> {
+        let cold_db = self.clickhouse_cold_storage.as_ref().or(self.cold_storage.as_ref())?;
+        Some(SplitDB::new(self.hot_storage.clone(), cold_db.clone()))
     }
 
     /// Returns underlying database for given temperature.
@@ -213,14 +238,30 @@ impl NodeStorage {
         self.cloud_storage.is_some()
     }
 
+    pub fn is_clickhouse_archive(&self) -> bool {
+        self.clickhouse_storage.is_some()
+    }
+
+    pub fn attach_clickhouse(&mut self, clickhouse: Arc<ClickHouseDB>) {
+        self.clickhouse_cold_storage =
+            clickhouse.read_enabled().then(|| Arc::new(ColdDB::new(clickhouse.clone())));
+        self.clickhouse_storage = Some(clickhouse);
+    }
+
     pub fn new_archive(
         hot: Arc<dyn Database>,
         cold: Option<Arc<dyn Database>>,
         cloud: Option<Arc<CloudStorage>>,
     ) -> Self {
         assert!(cold.is_some() || cloud.is_some());
-        let cold_storage = cold.map(|cold| Arc::new(crate::db::ColdDB::new(cold)));
-        Self { hot_storage: hot, cold_storage, cloud_storage: cloud }
+        let cold_storage = cold.map(|cold| Arc::new(ColdDB::new(cold)));
+        Self {
+            hot_storage: hot,
+            cold_storage,
+            cloud_storage: cloud,
+            clickhouse_storage: None,
+            clickhouse_cold_storage: None,
+        }
     }
 
     pub fn cold_db(&self) -> Option<&Arc<crate::db::ColdDB>> {

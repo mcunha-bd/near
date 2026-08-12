@@ -57,6 +57,7 @@ use near_primitives::validator_signer::{InMemoryValidatorSigner, ValidatorSigner
 use near_primitives::version::PROTOCOL_VERSION;
 #[cfg(feature = "rosetta_rpc")]
 use near_rosetta_rpc::RosettaRpcConfig;
+use near_store::archive::clickhouse::config::ClickHouseArchiveConfig;
 use near_store::archive::cloud_storage::config::{CloudArchivalConfig, CloudStorageContext};
 use near_store::config::SplitStorageConfig;
 use near_store::{StateSnapshotConfig, Store, TrieConfig};
@@ -271,6 +272,9 @@ pub struct Config {
     /// writes chunk-related data based on the tracked shards.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cloud_archival_writer: Option<CloudArchivalWriterConfig>,
+    /// Configuration for ClickHouse-backed cold archival storage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clickhouse_archival: Option<ClickHouseArchiveConfig>,
 
     /// If save_trie_changes is not set it will get inferred from the `archive` field as follows:
     /// save_trie_changes = !archive
@@ -492,6 +496,7 @@ impl Default for Config {
             archive: false,
             cloud_archival: None,
             cloud_archival_writer: None,
+            clickhouse_archival: None,
             save_trie_changes: None,
             save_state_changes: None,
             save_tx_outcomes: None,

@@ -37,6 +37,7 @@ impl<'a> ConfigValidator<'a> {
     /// this function would check all conditions, and add all error messages to ConfigValidator.errors
     fn validate_all_conditions(&mut self) {
         self.validate_cloud_archival_config();
+        self.validate_clickhouse_archival_config();
         self.validate_cold_store_config();
         self.validate_state_sync_config();
         self.validate_tracked_shards_config();
@@ -258,6 +259,28 @@ impl<'a> ConfigValidator<'a> {
                     "`archive` is false, but `split_storage` is configured.".to_string();
                 self.validation_errors.push_config_semantics_error(error_message);
             }
+        }
+    }
+
+    fn validate_clickhouse_archival_config(&mut self) {
+        let Some(config) = &self.config.clickhouse_archival else {
+            return;
+        };
+        if let Err(error) = config.validate() {
+            self.validation_errors.push_config_semantics_error(format!(
+                "invalid clickhouse_archival config: {error}"
+            ));
+        }
+        if !self.config.archive {
+            self.validation_errors.push_config_semantics_error(
+                "`archive` is false, but `clickhouse_archival` is configured".to_owned(),
+            );
+        }
+        if config.write_enabled && self.config.save_trie_changes != Some(true) {
+            self.validation_errors.push_config_semantics_error(format!(
+                "clickhouse archival writes are enabled, but save_trie_changes is {:?}; trie changes must be saved to populate cold state",
+                self.config.save_trie_changes
+            ));
         }
     }
 
