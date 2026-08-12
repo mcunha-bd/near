@@ -10,15 +10,13 @@ architecture and [README.md](README.md) for the current provisioning instruction
 1. Read the repository `AGENTS.md` before changing code. In particular, do not run the protocol
    schema check or update OpenAPI unless the user explicitly asks. Run `cargo fmt` after Rust edits,
    and run the repository-wide clippy command only immediately before a requested commit.
-2. Inspect the working tree before editing. The implementation was developed on `master` from base
-   commit `82983fe95e9ac41503998b42b607d37e19ff2939` and was not committed. The next machine may have
-   a different base or additional user changes, so treat this hash as historical context rather
-   than a checkout instruction.
-3. Preserve unrelated user-owned changes. At the time of this handoff, `.gitignore` was modified and
-   `.cgcignore` was untracked before the ClickHouse work started. Do not overwrite or remove them.
-4. Review the current diff and confirm that the ClickHouse files are still uncommitted or were
-   transferred into the new checkout. Do not assume Cargo caches, a ClickHouse binary, or a running
-   ClickHouse server exist on the next machine.
+2. Start from implementation commit `4a72648c173aa333b3f5987e5ff28e42a38502d1`
+   (`feat(clickhouse): resume background cold-store bootstrap`). Inspect the working tree before
+   editing because the next machine may have additional user changes.
+3. Do not assume Cargo caches, a ClickHouse binary, or a running ClickHouse server exist on the
+   next machine.
+4. Preserve unrelated user-owned changes and keep the ClickHouse implementation changes scoped to
+   the files listed below unless the task needs a broader design change.
 5. Keep the phase boundary explicit: the working code is a raw key/value parity backend. The
    normalized block, shard, locator, trie, epoch, and commit tables in the design document are not
    implemented yet.
@@ -29,6 +27,36 @@ The current increment gives nearcore a lossless ClickHouse cold backend while re
 RocksDB keys, values, Borsh encodings, and existing `DBCol` lookup behavior. It is intended to prove
 integration correctness before committing to the more normalized and storage-efficient target
 model.
+
+### Implemented in code
+
+The following is implemented in `4a72648c1`:
+
+- `ClickHouseArchiveConfig::bootstrap_from_local_cold_store`, defaulting to `true`. This makes a
+  newly recreated disposable ClickHouse table bootstrap automatically when neard restarts.
+- Local cold RocksDB and ClickHouse write independently. The normal local cold actor starts first
+  and keeps the client usable while ClickHouse bootstraps in the background.
+- The ClickHouse actor has two serialized states: bootstrap, then finalized-height tail. It cannot
+  tail-write while its bootstrap is in progress.
+- A bootstrap captures local `H0` once, checkpoints Borsh progress in the ClickHouse raw table after
+  every bounded batch, and writes ClickHouse `HEAD`/`COLD_HEAD` only after all cold columns finish.
+- Bootstrap progress includes `H0`, completed cold columns, the last written key, and a sequence
+  number used to make the newest `ReplacingMergeTree` checkpoint row win deterministically.
+- Restart retry resumes after the stored key in the unfinished column. It validates that the local
+  cold store still covers the recorded `H0` before doing so.
+- The raw-copy helper now accepts/resumes a `ColdStoreCopyProgress` cursor and checkpoints after
+  every source batch; a focused unit test simulates an interruption within `DBCol::Block`.
+- The ClickHouse provisioning README describes dual-write, background bootstrap, restart resume,
+  and resetting a disposable target by recreating its table.
+
+The implementation commit touches:
+
+- `chain/client/src/archive/cold_store_actor.rs`
+- `core/store/src/archive/clickhouse/config.rs`
+- `core/store/src/archive/cold_storage.rs`
+- `core/store/src/db/clickhouse.rs`
+- `core/store/src/db/mod.rs`
+- `docs/architecture/next/clickhouse/{MEMORY,README}.md`
 
 ### ClickHouse database backend
 
@@ -42,6 +70,8 @@ It currently covers:
 - Startup validation against `system.columns` so an absent or incompatible raw table fails fast.
 - RowBinary inserts that preserve binary keys and values without JSON or hexadecimal value storage.
 - Configurable request splitting by approximate bytes and row count.
+- Bootstrap-progress writes with a monotonic version above the captured bootstrap height, so the
+  `ReplacingMergeTree` row for the checkpoint is unambiguous.
 - Point reads by `(chain_id, column_name, row_key)`.
 - Ordered full-column, prefix, and bounded-range iteration using `argMax` to resolve replacement
   rows without `FINAL`.
@@ -61,8 +91,9 @@ expected single-reference representation and filters invalid cold operations.
 
 [../../../../core/store/src/archive/clickhouse/config.rs](../../../../core/store/src/archive/clickhouse/config.rs)
 defines `ClickHouseArchiveConfig` with endpoint, database, table, username, password file, separate
-read/write switches, timeouts, and insert limits. Identifier validation prevents database or table
-names from being interpolated as arbitrary SQL.
+read/write switches, `bootstrap_from_local_cold_store` (default `true`), timeouts, and insert
+limits. Identifier validation prevents database or table names from being interpolated as arbitrary
+SQL.
 
 `nearcore/src/config.rs` exposes it as `clickhouse_archival`. `nearcore/src/config_validate.rs`
 currently enforces:
@@ -79,7 +110,17 @@ running migration never reads its source data back from ClickHouse.
 
 `nearcore/src/lib.rs` opens and validates ClickHouse, attaches it to `NodeStorage`, starts an
 independent archive actor for writes, and exposes `clickhouse_archive_loop_handle`. Local cold
-RocksDB and ClickHouse writers can run concurrently.
+RocksDB remains the authoritative writer while the ClickHouse actor runs independently.
+
+### Local ClickHouse is the performance baseline
+
+The endpoint supports a remote ClickHouse instance so operators can use a disposable target without
+placing it on the node. Do not favor that topology for compression, ingestion-throughput, or lookup
+latency evaluation: network transport, TLS, and remote storage variability obscure the database
+result. Run the primary corpus and codec benchmarks against a local ClickHouse instance on the same
+host (ideally with explicitly mounted fast and cold volumes). Use a remote instance only when the
+goal is testing the networked deployment, failure handling, credentials, or operational topology,
+and report its network cost separately from ClickHouse storage performance.
 
 ### Finalized-height writer and resumability
 
@@ -96,14 +137,24 @@ There are two source paths:
 
 - Legacy archive RocksDB without a split cold store: replay canonical finalized heights from the
   archival RocksDB.
-- Existing split archive: bulk-stream the completed local cold RocksDB snapshot first, then resume
-  finalized-height writes from its head through a local hot+cold split source.
+- Existing split archive: when the ClickHouse table is empty, a background bootstrap actor records
+  the local cold `HEAD` as `H0`, then bulk-streams local cold rows in the background while the local
+  cold writer continues running. After every successful bounded insert batch, it persists a Borsh
+  `ClickHouseBootstrapProgress` row in `DBCol::BlockMisc`: the captured `H0`, completed-column
+  count, last copied key, and monotonic checkpoint version. After a process restart, it resumes at
+  the next key in that same column for the original `H0`. It refuses to resume if the local cold
+  head no longer covers that recorded head or the checkpoint is structurally invalid. Only after
+  every column is copied does it write `HEAD` and `COLD_HEAD` as `H0`, then start the finalized-height
+  tail through a local hot+cold split source. Rows after `H0` may be copied early but are replayed
+  by the tail before becoming visible.
 
-`core/store/src/archive/cold_storage.rs::copy_all_cold_data` implements the second path. It streams
-cold columns in bounded transactions and deliberately writes `HEAD` last. An interrupted import has
-no committed target head and can restart idempotently. `ClickHouseDB` stops accepting writes after
-the first latched error, which prevents a partially failed bulk import from writing `HEAD` later in
-the same attempt.
+`core/store/src/archive/cold_storage.rs::copy_all_cold_data` implements the resumable bulk copy. It
+uses ordered `iter_range` from the checkpoint key, skips that already committed key, checkpoints
+after every bounded transaction, and deliberately writes the captured `HEAD` and `COLD_HEAD` last.
+An interrupted import therefore has no committed target head and resumes without repeating its
+whole active column.
+`ClickHouseDB` stops accepting writes after the first latched error, which prevents a partially
+failed bulk import from writing the markers later in the same attempt.
 
 ### ClickHouse provisioning artifacts
 
@@ -121,24 +172,34 @@ The raw table is the implemented Phase 1 model. The normalized tables described 
 
 ## Verification completed on the original machine
 
-The following commands passed after the final Rust changes:
+The following commands passed after the latest Rust changes:
 
 ```text
 cargo fmt --check
-cargo check -p near-store -p near-client -p nearcore --message-format short
 git diff --check
 ```
 
-The focused unit test was attempted with the repository-required command:
+The new focused resume test was added at
+`archive::cold_storage::test::test_copy_all_cold_data_resumes_from_last_key`. It simulates an
+interruption after a bounded `DBCol::Block` batch and verifies that the resumed copy contains every
+source row. It was attempted with the repository-required command:
 
 ```text
-cargo test --package near-store --features test_features -- db::clickhouse::tests::rowbinary_string_roundtrip --exact --show-output
+cargo test --package near-store --features test_features -- archive::cold_storage::test::test_copy_all_cold_data_resumes_from_last_key --exact --show-output
 ```
 
-It did not reach the selected test. The unrelated `near-test-contracts` build was SIGKILLed while
-building the embedded `wasm32-unknown-unknown` standard library (`libc`, then `object`). Retrying
-with `CARGO_BUILD_JOBS=2` failed at the same external build step. Treat this as an unresolved test
-environment/resource issue, not as a passing test and not as a ClickHouse test failure.
+The process ended while compiling its large dependency closure and did not return a test result.
+Treat this as unverified, not passing.
+
+The production compile command was also attempted:
+
+```text
+cargo check -p near-store -p near-client -p nearcore --message-format short
+```
+
+It did not reach nearcore source compilation. `clang-sys` failed while building the RocksDB
+dependency because this host has neither `llvm-config` nor a discoverable `libclang.so`. Set
+`LLVM_CONFIG_PATH`/`LIBCLANG_PATH` or install an appropriate LLVM/Clang package before retrying.
 
 No ClickHouse server or `clickhouse-local` binary was available on the original machine. Therefore:
 
@@ -156,8 +217,10 @@ The next session must not describe this implementation as production-ready until
 1. Add a real ClickHouse integration-test fixture pinned to an explicit server version. Apply
    `001_archive.sql`, exercise every `Database` read/write method, and test binary keys and values,
    reference-counted columns, tombstones, retries, and multi-request partial failures.
-2. Test `copy_all_cold_data` with an interrupted bulk import. Verify that `HEAD` is absent after any
-   failed batch and that restart converges without logical duplicates or missing rows.
+2. Run the new `copy_all_cold_data` resume unit test once the build environment is usable, then add
+   an integration test that interrupts a real ClickHouse bootstrap after a checkpoint. Verify that
+   `HEAD` is absent after any failed batch and that restart converges without logical duplicates or
+   missing rows.
 3. Add differential tests against `TestDB` or a temporary RocksDB for point, prefix, range, raw, and
    reference-counted reads. Include empty keys, zero bytes, large values, and ordering boundaries.
 4. Validate the exact RowBinary representation and all DDL against the chosen ClickHouse release.
@@ -238,8 +301,10 @@ reference-counted, RPC, and indexer reads for the selected protocol eras and res
 
 Status: raw snapshot streaming exists; normalized bulk loading is not implemented.
 
-For an existing split archive, the current startup path bulk-streams the local cold RocksDB snapshot
-and commits its `HEAD` last. This is sufficient for raw-parity migration testing. It does not provide
+For an existing split archive, the current background bootstrap path bulk-streams the local cold
+RocksDB while its writer remains active, checkpoints every bounded batch by last key, and commits
+the captured `HEAD` and `COLD_HEAD` last. This is sufficient for raw-parity migration testing. It
+does not provide
 the design's deterministic height ranges, source checkpoint, normalized fact/locator tables,
 manifests, digests, locator coverage, or highest-contiguous-range commit protocol.
 
@@ -308,15 +373,17 @@ Exit gate: the operator approves retirement after rollback, restore, rebuild, an
 1. Reproduce the production build and resolve the `near-test-contracts` test-environment failure.
 2. Stand up a pinned local ClickHouse and add end-to-end RowBinary/schema tests.
 3. Run a small RocksDB-to-ClickHouse raw migration and build a differential verifier.
-4. Add migration and lag metrics before increasing the corpus size.
-5. Implement Phase 0 census tooling and run it against a representative archive copy.
-6. Benchmark the raw schema and the normalized design from `DESIGNDOC.md` on the same corpus.
-7. Decide whether to keep raw parity as an operational fallback only or retain selected raw rows in
+4. Exercise process restart during bootstrap, including a restart within `DBCol::State`, then verify
+   the persisted `CLICKHOUSE_BOOTSTRAP_PROGRESS` checkpoint and final `HEAD` directly in ClickHouse.
+5. Add migration and lag metrics before increasing the corpus size.
+6. Implement Phase 0 census tooling and run it against a representative archive copy.
+7. Benchmark the raw schema and the normalized design from `DESIGNDOC.md` on the same corpus.
+8. Decide whether to keep raw parity as an operational fallback only or retain selected raw rows in
    the final model.
-8. Implement deterministic normalized-range export, manifests, and locators only after the data
+9. Implement deterministic normalized-range export, manifests, and locators only after the data
    justifies them.
-9. Run the Phase 3 shadow program before enabling production reads.
-10. Treat transactional history and historical state as separate cutover decisions.
+10. Run the Phase 3 shadow program before enabling production reads.
+11. Treat transactional history and historical state as separate cutover decisions.
 
 ## Useful commands
 
@@ -333,6 +400,7 @@ Run focused tests using the repository-required form:
 cargo test --package near-store --features test_features -- db::clickhouse::tests::rowbinary_string_roundtrip --exact --show-output
 cargo test --package near-store --features test_features -- db::clickhouse::tests::rowbinary_long_string_roundtrip --exact --show-output
 cargo test --package near-store --features test_features -- archive::clickhouse::config::tests::rejects_sql_in_identifiers --exact --show-output
+cargo test --package near-store --features test_features -- archive::cold_storage::test::test_copy_all_cold_data_resumes_from_last_key --exact --show-output
 ```
 
 Do not run clippy unless a commit is about to be created. When the user asks for a commit, use the

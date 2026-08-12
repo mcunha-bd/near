@@ -837,6 +837,7 @@ mod test {
     use crate::{DBCol, Store};
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
+    use strum::IntoEnumIterator;
 
     #[test]
     fn test_copy_state_to_cold_batches() {

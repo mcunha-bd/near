@@ -21,6 +21,7 @@ use std::io::{self, Error};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration as StdDuration, Instant};
+use strum::IntoEnumIterator;
 
 /// The ColdStoreCopyResult indicates if and what block was copied.
 #[derive(Debug)]
@@ -501,7 +502,7 @@ pub fn create_clickhouse_archive_actor(
         .is_none()
         .then_some(())
         .filter(|()| clickhouse_db.bootstrap_from_local_cold_store())
-        .and(migration_cold_db.cloned());
+        .and_then(|()| migration_cold_db.cloned());
 
     create_cold_store_actor_for_backend(
         save_trie_changes,

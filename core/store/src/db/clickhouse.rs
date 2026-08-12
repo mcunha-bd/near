@@ -1,15 +1,17 @@
 use crate::archive::clickhouse::config::ClickHouseArchiveConfig;
 use crate::db::refcount;
-use crate::db::{DBIterator, DBOp, DBSlice, DBTransaction, Database};
-use crate::{CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY, DBCol, StoreStatistics};
+use crate::db::{
+    CLICKHOUSE_BOOTSTRAP_PROGRESS_KEY, DBIterator, DBOp, DBSlice, DBTransaction, Database,
+};
+use crate::{DBCol, StoreStatistics};
 use anyhow::{Context, Error, Result, anyhow, bail, ensure};
 use hex::encode as hex_encode;
+use parking_lot::{Mutex, MutexGuard};
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, RequestBuilder};
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard};
 
 #[derive(Clone)]
 struct Row {
@@ -105,7 +107,7 @@ impl ClickHouseDB {
     }
 
     fn lock_error(&self) -> MutexGuard<'_, Option<String>> {
-        self.last_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.last_error.lock()
     }
 
     fn record_error(&self, error: &Error) {
